@@ -1,7 +1,7 @@
 
 # **Polder analysis from ArcGIS**
 
-This project is to show a step-by-step guide on what analysis is conducted for to get to the results of the 'Shifting Shores: Historical Inundation and Land‑Cover Change' guided-research report. Created by Michiel van Dijk under supervision of Dr. Jim van Belzen (NIOZ) and Prof. Dr. Maarten Kleinhans (Utrecht University).
+This project is to show the code to get to the results of the 'Shifting Shores: Historical Inundation and Land‑Cover Change' guided-research report. Created by Michiel van Dijk under supervision of Dr. Jim van Belzen (NIOZ) and Prof. Dr. Maarten Kleinhans (Utrecht University). Each section has a header with what code it contains and some 'how to use' parts. 
 
 
 ## Imports
@@ -34,6 +34,7 @@ from shapely.geometry import shape as shp_shape
 import json
 ```
 ## **Helper functions**
+These are loaded and are later used, this part includes the base folder etc. which need to be changed to the users pathing of ArcGIS etc.
 ```python
 
 # scipy functions required for component detection/dilation and distances
@@ -1071,6 +1072,7 @@ if __name__ == "__main__":
 ```
 
 ## **Zeeland (Province) analysis code**
+Firstly it computes the A, I, S. The S is taken from snapshots in salt marsh and then calculates the slope between the two points. 
 ```python
 #%% A,I,S,dA/dt,dS/dt
 def _infer_px_area_ha(g):
@@ -1657,6 +1659,9 @@ if __name__ == "__main__":
                 print(iid, info['island_name'], "alpha_median:", info['summary']['alpha']['median'], "beta_median:", info['summary']['beta']['median'])
     except Exception as e:
         print("compute_alpha_beta failed:", e)
+```
+# **calculate the rA**
+```python
 #%% rA for each island seperated
 # Compute rA (interval-wise + fitted global) with min_S_ha = 1.0
 import numpy as np, warnings
@@ -1839,11 +1844,164 @@ def compute_rA_and_fits(min_S_ha=1.0, do_nnls=True):
 
 # run with min_S_ha=1.0
 _out = compute_rA_and_fits(min_S_ha=1.0, do_nnls=True)
+```
+# **Do all for Zeeland as a whole, so alpha rates etc.** 
+```python
 #%% Zeeland as a single aggregated system (area + rates + rA + RK4)
 g = globals()
+def compute_alpha_beta_zeeland(
+    min_area_ha: float = 1.0,
+    min_inund_ha: float = 1.0,
+    years: Optional[list] = None,
+    fit_global: bool = True,
+    plot: bool = True,
+) -> Dict[str, Any]:
+    """
+    Compute per-interval alpha and beta series for Zeeland as a single unified entity.
 
+    Args:
+      min_area_ha: Minimum A(t) to compute alpha_t for an interval.
+      min_inund_ha: Minimum I(t) to compute beta_t for an interval.
+      years: List of years to analyze; if None, inferred from globals.
+      fit_global: Fit global alpha/beta across all valid intervals (optional).
+      plot: Show diagnostic plots (requires matplotlib).
+
+    Returns:
+      dict with computed series and summaries (years, A_zeeland, newly_inund_zeeland, alpha_zeeland, beta_zeeland, etc.).
+    """
+    g = globals()
+    px_area_ha = _infer_px_area_ha(g)
+
+    df_yearly = g.get("df_yearly", None)
+    land_masks_cache = g.get("land_masks_by_year") or g.get("land_masks") or None
+
+    if years is None:
+        if df_yearly is not None and "Year" in df_yearly.columns:
+            years_list = sorted(int(x) for x in df_yearly["Year"].values)
+        elif land_masks_cache is not None:
+            years_list = sorted(int(x) for x in land_masks_cache.keys())
+        elif "YEARS" in g:
+            years_list = list(map(int, g["YEARS"]))
+        else:
+            raise RuntimeError("Could not infer years. Ensure df_yearly, land_masks_by_year, or YEARS exist in globals.")
+    else:
+        years_list = sorted(int(y) for y in years)
+
+    if len(years_list) < 2:
+        raise ValueError("Need at least two years to compute per-interval quantities.")
+
+    interval_years = np.array(years_list[:-1], dtype=int)
+    n_intervals = len(interval_years)
+
+    if land_masks_cache is not None:
+        masks = {int(y): land_masks_cache[int(y)].astype(bool) for y in years_list}
+    else:
+        rasterize_fn = g.get("rasterize_union_year")
+        df_all = g.get("df_all")
+        if rasterize_fn is None or df_all is None:
+            raise RuntimeError("No cached land masks and cannot rasterize (missing rasterize_union_year or df_all).")
+        masks = {}
+        for y in years_list:
+            lm, _ = rasterize_fn(
+                df_all,
+                int(y),
+                int(g["width"]),
+                int(g["height"]),
+                g["transform"],
+                sf=g.get("SUBSAMPLE_FACTOR", 1),
+                coverage_threshold=float(g.get("COVERAGE_THRESHOLD", 0.5)),
+            )
+            masks[int(y)] = lm.astype(bool)
+
+    example = next(iter(masks.values()))
+    H, W = example.shape
+    earlier_union = np.zeros((H, W), dtype=bool)
+    A_list = []
+    I_list = []
+
+    # Compute total land area (A) and inundation (I) for Zeeland as a whole
+    for y in years_list:
+        land = masks[int(y)]
+        A_ha = float(np.sum(land)) * px_area_ha
+        I_mask = earlier_union & (~land)
+        I_ha = float(np.sum(I_mask)) * px_area_ha
+        A_list.append(A_ha)
+        I_list.append(I_ha)
+        earlier_union = earlier_union | land
+
+    A_zeeland = np.array(A_list, dtype=float)
+    I_zeeland = np.array(I_list, dtype=float)
+    dI_zeeland = np.diff(I_zeeland)
+
+    # Compute newly inundated area per year
+    newly_zeeland = np.zeros(n_intervals, dtype=float)
+    for idx, y in enumerate(interval_years):
+        lm0 = masks[int(y)]
+        next_year = int(years_list[idx + 1])
+        lm1 = masks[next_year]
+        newly_px = int(np.sum(lm0 & (~lm1)))
+        newly_zeeland[idx] = float(newly_px) * px_area_ha
+
+    # Compute alpha_zeeland for each interval
+    alpha_zeeland = np.full(n_intervals, np.nan, dtype=float)
+    for i in range(n_intervals):
+        At = A_zeeland[i]
+        if At >= min_area_ha and At > 0:
+            alpha_zeeland[i] = newly_zeeland[i] / At
+
+    # Compute beta_zeeland for each interval
+    beta_zeeland = np.full(n_intervals, np.nan, dtype=float)
+    for i in range(n_intervals):
+        It = I_zeeland[i]
+        if It >= min_inund_ha and It > 0 and np.isfinite(alpha_zeeland[i]):
+            beta_zeeland[i] = (alpha_zeeland[i] * A_zeeland[i] - dI_zeeland[i]) / It
+
+    # Summarize alpha and beta for Zeeland
+    summary_zeeland = {
+        "alpha": _summarize(alpha_zeeland),
+        "beta": _summarize(beta_zeeland),
+    }
+
+    # Fit global alpha/beta for Zeeland
+    fitted_zeeland = None
+    if fit_global:
+        valid_mask = np.isfinite(A_zeeland[:-1]) & np.isfinite(I_zeeland[:-1]) & np.isfinite(dI_zeeland)
+        if valid_mask.sum() >= 2:
+            A_fit = A_zeeland[:-1][valid_mask]
+            I_fit = I_zeeland[:-1][valid_mask]
+            dI_fit = dI_zeeland[valid_mask]
+            alpha_fit, beta_fit, resid, r2, method = _fit_alpha_beta_nnls(A_fit, I_fit, dI_fit)
+            fitted_zeeland = {
+                "alpha_fit": alpha_fit,
+                "beta_fit": beta_fit,
+                "method": method,
+                "r2": r2,
+                "residuals": resid,
+                "n_used": int(valid_mask.sum()),
+            }
+
+    # Compile results for Zeeland
+    results = {
+        "years": interval_years,
+        "A_series_ha": A_zeeland[:-1],
+        "newly_inund_ha": newly_zeeland,
+        "alpha_series": alpha_zeeland,
+        "I_series_ha": I_zeeland[:-1],
+        "dI_ha": dI_zeeland,
+        "beta_series": beta_zeeland,
+        "summary": summary_zeeland,
+        "fitted": fitted_zeeland,
+        "px_area_ha": px_area_ha,
+    }
+
+    return results
+res_zeeland = compute_alpha_beta_zeeland(
+    min_area_ha=1.0,
+    min_inund_ha=1.0,
+    fit_global=True  # Enable global fitting
+)
 # ------------------------------------------------------------------
-# 1. Compute observed totals and rates (EXPLICITLY SEPARATED)
+# 1. Compute observed totals and rates  
 res_area  = compute_area_changes(per_island=False)
 res_rates = compute_alpha_beta(per_island=False)
 
@@ -1863,13 +2021,9 @@ n_years = len(years)
 alpha_zeeland = np.nan
 beta_zeeland  = np.nan
 
-if isinstance(res_rates.get('fitted'), dict):
-    alpha_zeeland = res_rates['fitted'].get('alpha_fit', np.nan)
-    beta_zeeland  = res_rates['fitted'].get('beta_fit', np.nan)
-
 if not np.isfinite(alpha_zeeland) or not np.isfinite(beta_zeeland):
-    alpha_zeeland = res_rates['summary']['alpha_zeeland']['mean']
-    beta_zeeland  = res_rates['summary']['beta_zeeland']['mean']
+    alpha_zeeland = res_zeeland['summary']['alpha']['mean']
+    beta_zeeland  = res_zeeland['summary']['beta']['mean']
 
 alpha_zeeland = float(alpha_zeeland)
 beta_zeeland  = float(beta_zeeland)
@@ -1877,6 +2031,7 @@ beta_zeeland  = float(beta_zeeland)
 # ------------------------------------------------------------------
 # 3. Compute rA for Zeeland as a whole
 #    rA_t = (A_{t+1} - A_t + alpha * A_t) / S_t
+# ------------------------------------------------------------------
 rA_vals_z = []
 
 for t in range(n_years - 1):
@@ -1897,6 +2052,7 @@ g['rA_interval_global'] = {
     "values": rA_vals_z
 }
 
+# ------------------------------------------------------------------
 # 4. Aggregate g and S_max (collapsed islands)
 g_by_id     = g.get('g_by_id')
 S_max_by_id = g.get('S_max_by_id')
@@ -1927,6 +2083,7 @@ if S_max_total <= 0:
     finite_S = S_obs[np.isfinite(S_obs)]
     S_max_total = float(np.nanmax(finite_S)) if finite_S.size else max(1.0, np.nanmax(A_obs))
 
+# ------------------------------------------------------------------
 # 5. Aggregated ODE system
 def deriv(A, I, S):
     dS_growth = g_total * S * (1 - S / S_max_total)
@@ -1951,6 +2108,7 @@ def rk4_step(A, I, S, dt=1.0):
 
     return A_n, I_n, S_n
 
+# ------------------------------------------------------------------
 # 6. Run simulation
 A_sim = np.zeros(n_years)
 I_sim = np.zeros(n_years)
@@ -1965,7 +2123,8 @@ for t in range(n_years - 1):
         A_sim[t], I_sim[t], S_sim[t]
     )
 
-# RMSE diagnostics
+# ------------------------------------------------------------------
+# 7. RMSE diagnostics
 def rmse(obs, sim):
     m = np.isfinite(obs)
     return np.sqrt(np.mean((obs[m] - sim[m])**2)) if m.any() else np.nan
@@ -1974,91 +2133,22 @@ rmse_A = rmse(A_obs, A_sim)
 rmse_I = rmse(I_obs, I_sim)
 rmse_S = rmse(S_obs, S_sim)
 
+print("Zeeland aggregated parameters:")
+print(f" alpha_Z = {alpha_zeeland:.4e}")
+print(f" beta_Z  = {beta_zeeland:.4e}")
+print(f" rA_z    = {rA_z:.4e}")
+print(f" g     = {g_total:.4e}")
+print(f" Smax  = {S_max_total:.1f} ha")
+
+print(f"RMSE (ha): A={rmse_A:.1f}, I={rmse_I:.1f}, S={rmse_S:.1f}")
+
 # save to globals
 g['A_sim_total'] = A_sim
 g['I_sim_total'] = I_sim
 g['S_sim_total'] = S_sim
 g['rmse_totals'] = {'A': rmse_A, 'I': rmse_I, 'S': rmse_S}
 ```
-## Get A I and S for Zeeland
-```python
-#%% A, I, S for Zeeland as a whole (snapshot-aligned)
-g = globals()
 
-# ------------------------------------------------------------------
-# 1) Get area results (Zeeland-wide)
-# ------------------------------------------------------------------
-res_area = g.get('res_area') or g.get('res')
-if not isinstance(res_area, dict):
-    raise RuntimeError("Run compute_area_changes(per_island=False) and store as res_area")
-
-years = np.asarray(res_area['years'], dtype=int)
-n_years = years.size
-if n_years < 2:
-    raise RuntimeError("Need at least 2 snapshot years")
-
-A = np.asarray(res_area['A_ha'], dtype=float)
-I = np.asarray(res_area['I_ha'], dtype=float)
-
-# ------------------------------------------------------------------
-# 2) Build S(t) for Zeeland
-# ------------------------------------------------------------------
-S = None
-
-# preferred: snapshot salt-marsh areas already computed
-if 'S_snap_ha' in res_area:
-    S = np.asarray(res_area['S_snap_ha'], dtype=float)
-
-# fallback: compute from marsh_archive
-if S is None or not np.any(np.isfinite(S)):
-    marsh_archive = g.get('marsh_archive')
-    px_area = g.get('px_area_ha', 1.0)
-
-    if isinstance(marsh_archive, dict):
-        S_vals = np.full(n_years, np.nan, dtype=float)
-        for i, y in enumerate(years):
-            m = marsh_archive.get(int(y))
-            if m is not None:
-                S_vals[i] = float(np.sum(np.asarray(m, dtype=bool))) * px_area
-        S = S_vals
-    else:
-        S = np.full(n_years, np.nan, dtype=float)
-
-# ------------------------------------------------------------------
-# 3) Enforce snapshot alignment (safety)
-# ------------------------------------------------------------------
-def _align(arr, n):
-    arr = np.asarray(arr, dtype=float)
-    if arr.size == n:
-        return arr
-    if arr.size == n - 1:
-        return np.append(arr, arr[-1])
-    out = np.full(n, np.nan)
-    out[:min(n, arr.size)] = arr[:min(n, arr.size)]
-    return out
-
-A = _align(A, n_years)
-I = _align(I, n_years)
-S = _align(S, n_years)
-
-# ------------------------------------------------------------------
-# 4) Store in globals (single-system convention)
-# ------------------------------------------------------------------
-g['years_zeeland'] = years
-g['A_total'] = A
-g['I_total'] = I
-g['S_total'] = S
-
-# ------------------------------------------------------------------
-# 5) Quick sanity check
-# ------------------------------------------------------------------
-print("Zeeland-wide A/I/S built:")
-print(" years[0:5]:", years[:5])
-print(" A[0:5]:", A[:5])
-print(" I[0:5]:", I[:5])
-print(" S[0:5]:", S[:5])
-print(" lengths:", A.size, I.size, S.size)
-```
 ## **Growth factor g and S_max** 
 ```python
 #%% Compute growth factor g for Zeeland as a whole (list-based S)
@@ -2182,7 +2272,87 @@ print(" valid g points:", n_valid)
 print(" g_mean:", g_mean, " g_median:", g_median, " g_trimmed:", g_trimmed)
 print(" chosen g_total (saved to globals()['g_total']):", g_total)
 ```
+## **Now I put A S and I in a simple year system so they are all in session, just a preferation for me too keep sanity**
+```python
+#%% A, I, S for Zeeland as a whole (snapshot-aligned)
+g = globals()
+
+# ------------------------------------------------------------------
+# 1) Get area results (Zeeland-wide)
+# ------------------------------------------------------------------
+res_area = g.get('res_area') or g.get('res')
+if not isinstance(res_area, dict):
+    raise RuntimeError("Run compute_area_changes(per_island=False) and store as res_area")
+
+years = np.asarray(res_area['years'], dtype=int)
+n_years = years.size
+if n_years < 2:
+    raise RuntimeError("Need at least 2 snapshot years")
+
+A = np.asarray(res_area['A_ha'], dtype=float)
+I = np.asarray(res_area['I_ha'], dtype=float)
+
+# ------------------------------------------------------------------
+# 2) Build S(t) for Zeeland
+# ------------------------------------------------------------------
+S = None
+
+# preferred: snapshot salt-marsh areas already computed
+if 'S_snap_ha' in res_area:
+    S = np.asarray(res_area['S_snap_ha'], dtype=float)
+
+# fallback: compute from marsh_archive
+if S is None or not np.any(np.isfinite(S)):
+    marsh_archive = g.get('marsh_archive')
+    px_area = g.get('px_area_ha', 1.0)
+
+    if isinstance(marsh_archive, dict):
+        S_vals = np.full(n_years, np.nan, dtype=float)
+        for i, y in enumerate(years):
+            m = marsh_archive.get(int(y))
+            if m is not None:
+                S_vals[i] = float(np.sum(np.asarray(m, dtype=bool))) * px_area
+        S = S_vals
+    else:
+        S = np.full(n_years, np.nan, dtype=float)
+
+# ------------------------------------------------------------------
+# 3) Enforce snapshot alignment (safety)
+# ------------------------------------------------------------------
+def _align(arr, n):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == n:
+        return arr
+    if arr.size == n - 1:
+        return np.append(arr, arr[-1])
+    out = np.full(n, np.nan)
+    out[:min(n, arr.size)] = arr[:min(n, arr.size)]
+    return out
+
+A = _align(A, n_years)
+I = _align(I, n_years)
+S = _align(S, n_years)
+
+# ------------------------------------------------------------------
+# 4) Store in globals (single-system convention)
+# ------------------------------------------------------------------
+g['years_zeeland'] = years
+g['A_total'] = A
+g['I_total'] = I
+g['S_total'] = S
+
+# ------------------------------------------------------------------
+# 5) Quick sanity check
+# ------------------------------------------------------------------
+print("Zeeland-wide A/I/S built:")
+print(" years[0:5]:", years[:5])
+print(" A[0:5]:", A[:5])
+print(" I[0:5]:", I[:5])
+print(" S[0:5]:", S[:5])
+print(" lengths:", A.size, I.size, S.size)
+```
 ## **Simulation runs**
+This part is where i used observed data and the quantile starting points and let the simulation run from different initial values. It uses the g, alpha, beta and rA values
 ```python
 #%% Zeeland-wide simulation with quantile & mean starting points
 n_years = len(yrs)
@@ -2234,9 +2404,302 @@ for A0, I0, S0 in zip(A_start_vals, I_start_vals, S_start_vals):
     sim_results_I.append(I_sim)
     sim_results_S.append(S_sim)
 ```
-## **Kaplan-meier survival rates
+## **Kaplan-meier for each island**
+You need to run this before you run the next part, some helper functions in this code are used in the zeeland as a whole code. 
+```Python
+#%% A4 Kaplan-Meier survival rate 
+from typing import Tuple, Any, Dict, List
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+# try to import chi2 for exact CI; fallback if unavailable
+try:
+    from scipy.stats import chi2
+    SCIPY_CHI2 = True
+except Exception:
+    SCIPY_CHI2 = False
+
+
+def _compute_A4_mle_from_episodes(durations, events, alpha: float = 0.05) -> Tuple[Any, Any, Tuple[Any, Any], int, int]:
+    dur = np.asarray(durations, dtype=float)
+    ev = np.asarray(events, dtype=int)
+    n_total = dur.size
+    n_events = int(np.sum(ev))
+    if n_total == 0 or n_events <= 0:
+        return None, None, (None, None), n_events, n_total
+
+    # Total time at risk (sum of observed durations including censored)
+    T = float(np.sum(dur))
+    # MLE for exponential rate lambda_hat = r / T  => tau_hat = 1 / lambda_hat = T / r
+    lambda_hat = float(n_events) / float(T)
+    tau_hat = float(T) / float(n_events)
+
+    # approximate variance via delta method: var(tau_hat) = tau_hat^2 / r
+    var_tau = (tau_hat ** 2) / float(max(1, n_events))
+    se_tau = math.sqrt(var_tau)
+
+    # Confidence interval: use chi-square inversion for lambda if possible (exact)
+    ci_low_tau = None
+    ci_high_tau = None
+    if SCIPY_CHI2 and n_events > 0:
+        # CI for lambda: [chi2.ppf(alpha/2, 2r) / (2T), chi2.ppf(1-alpha/2, 2r) / (2T)]
+        # invert to get tau CI: [2T / chi2.ppf(1-alpha/2, 2r), 2T / chi2.ppf(alpha/2, 2r)]
+        df = 2 * n_events
+        # handle extreme cases: ppf(alpha/2) can be 0 when df small and alpha tiny, guard it
+        lower_chi = chi2.ppf(alpha / 2.0, df) if (alpha / 2.0) > 0 else 0.0
+        upper_chi = chi2.ppf(1.0 - alpha / 2.0, df)
+        try:
+            if upper_chi > 0:
+                ci_low_tau = 2.0 * T / upper_chi
+            else:
+                ci_low_tau = None
+            if lower_chi > 0:
+                ci_high_tau = 2.0 * T / lower_chi
+            else:
+                ci_high_tau = None
+        except Exception:
+            ci_low_tau = None
+            ci_high_tau = None
+
+    # fallback to normal approx on tau if chi2 unavailable or failed
+    if (ci_low_tau is None or ci_high_tau is None) and se_tau is not None:
+        z = 1.96  # 95% CI
+        ci_low_tau = max(0.0, tau_hat - z * se_tau)
+        ci_high_tau = tau_hat + z * se_tau
+
+    return float(tau_hat), float(var_tau), (float(ci_low_tau) if ci_low_tau is not None else None,
+                                           float(ci_high_tau) if ci_high_tau is not None else None), n_events, n_total
+
+
+# Reuse the episode extraction function (same as before)
+def extract_marsh_episodes_from_archive(marsh_archive, years, island_raster) -> pd.DataFrame:
+    years = np.asarray(sorted(years), dtype=int)
+    if len(years) == 0:
+        return pd.DataFrame(columns=['pixel_index', 'island_id', 'start_year', 'end_year', 'duration_years', 'event_observed'])
+    height, width = island_raster.shape
+    n_years = len(years)
+    stack = np.zeros((n_years, height, width), dtype=bool)
+    for i, y in enumerate(years):
+        mask = marsh_archive.get(int(y), None)
+        if mask is None:
+            mask = np.zeros((height, width), dtype=bool)
+        stack[i] = mask
+    rows = []
+    flat_idxs = np.nonzero(island_raster.ravel() > 0)[0]
+    for flat in flat_idxs:
+        r = int(flat // width); c = int(flat % width)
+        island_id = int(island_raster[r, c])
+        ts = stack[:, r, c]
+        i = 0
+        while i < n_years:
+            if not ts[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n_years and ts[j + 1]:
+                j += 1
+            start_year = int(years[i])
+            if j < n_years - 1:
+                end_year = int(years[j + 1])
+                duration = int(end_year - start_year)
+                event = 1
+            else:
+                end_year = -1
+                duration = int(years[-1] - start_year)
+                event = 0
+            pix_index = int(r * width + c)
+            rows.append((pix_index, island_id, start_year, end_year, duration, event))
+            i = j + 1
+    df = pd.DataFrame(rows, columns=['pixel_index', 'island_id', 'start_year', 'end_year', 'duration_years', 'event_observed'])
+    return df
+
+
+def compute_and_plot_all_islands_A4_mle(years=None, save_csv=None, px_area_ha=None, random_seed=None):
+    """
+    Compute Kaplan–Meier tables and overlay the exponential parametric curve derived from
+    the exponential MLE (tau = T/r) that properly accounts for right-censoring.
+
+    Returns:
+      figs: dict island_name -> matplotlib.Figure
+      df_summary: pandas.DataFrame summarizing A4-MLE results per island
+    """
+    g = globals()
+    required = ('island_raster', 'id_to_island', 'marsh_archive')
+    for name in required:
+        if name not in g:
+            raise RuntimeError(f"Required global '{name}' not found. Make sure island_raster, id_to_island and marsh_archive are available.")
+
+    if random_seed is not None:
+        np.random.seed(int(random_seed))
+
+    # determine years
+    if years is None:
+        res = g.get('res', {})
+        if isinstance(res, dict) and res.get('per_island'):
+            sample_iid = next(iter(res['per_island'].keys()))
+            years = list(res['per_island'][sample_iid]['years'])
+        else:
+            years = sorted([int(y) for y in list(g.get('marsh_archive', {}).keys())])
+    years = sorted([int(y) for y in years])
+
+    df_polder = g.get('episodes_polder_df', pd.DataFrame())
+    df_inund = g.get('episodes_inund_df', pd.DataFrame())
+    marsh_archive = g.get('marsh_archive', {})
+
+    island_raster = g['island_raster']
+    id_to_island = g['id_to_island']
+
+    figs = {}
+    summary_rows: List[Dict[str, Any]] = []
+
+    print("Extracting marsh episodes from marsh_archive...")
+    df_marsh_episodes = extract_marsh_episodes_from_archive(marsh_archive, years, island_raster)
+    if not df_marsh_episodes.empty and 'island' not in df_marsh_episodes.columns:
+        df_marsh_episodes['island'] = df_marsh_episodes['island_id'].map(id_to_island)
+
+    for iid, island_name in sorted([(k, v) for k, v in id_to_island.items()], key=lambda x: x[1]):
+        print(f"Processing island: {island_name} (id={iid})")
+        mask_p = (df_polder['island_id'] == iid) if (not df_polder.empty and 'island_id' in df_polder.columns) else np.array([], dtype=bool)
+        mask_i = (df_inund['island_id'] == iid) if (not df_inund.empty and 'island_id' in df_inund.columns) else np.array([], dtype=bool)
+        dfp = df_polder[mask_p] if not df_polder.empty else pd.DataFrame()
+        dfi = df_inund[mask_i] if not df_inund.empty else pd.DataFrame()
+        dfm = df_marsh_episodes[df_marsh_episodes['island_id'] == iid] if not df_marsh_episodes.empty else pd.DataFrame()
+
+        dur_p = np.asarray(dfp['duration_years'].values) if not dfp.empty else np.array([])
+        ev_p = np.asarray(dfp['event_observed'].values) if not dfp.empty else np.array([])
+        dur_i = np.asarray(dfi['duration_years'].values) if not dfi.empty else np.array([])
+        ev_i = np.asarray(dfi['event_observed'].values) if not dfi.empty else np.array([])
+        dur_m = np.asarray(dfm['duration_years'].values) if not dfm.empty else np.array([])
+        ev_m = np.asarray(dfm['event_observed'].values) if not dfm.empty else np.array([])
+
+        # KM tables
+        km_p = _kaplan_meier_table(dur_p, ev_p) if dur_p.size else pd.DataFrame()
+        km_i = _kaplan_meier_table(dur_i, ev_i) if dur_i.size else pd.DataFrame()
+        km_m = _kaplan_meier_table(dur_m, ev_m) if dur_m.size else pd.DataFrame()
+
+        # A4 MLE (exponential MLE with censoring)
+        a4_mle_p = _compute_A4_mle_from_episodes(dur_p, ev_p)
+        a4_mle_i = _compute_A4_mle_from_episodes(dur_i, ev_i)
+        a4_mle_m = _compute_A4_mle_from_episodes(dur_m, ev_m)
+
+        # Plot KM + exponential (MLE) overlay
+        if plt is None:
+            print("matplotlib not available; skipping plotting.")
+            fig = None
+        else:
+            fig, axes = plt.subplots(3, 1, figsize=(8, 10), squeeze=False)
+            fig.suptitle(f"Island: {island_name}", fontsize=14)
+            ax_p = axes[0][0]; ax_i = axes[1][0]; ax_m = axes[2][0]
+
+            def _plot_km_with_mle(ax, km_df, a4_tuple, color, label):
+                if km_df.empty:
+                    ax.text(0.5, 0.5, "No episodes", transform=ax.transAxes, ha='center', va='center')
+                    ax.set_xlim(0, max(1.0, float(years[-1] - years[0])))
+                    ax.set_ylim(0, 1.02)
+                    ax.set_title(label)
+                    fig.suptitle(f"Island: {island_name}", fontsize=14)
+                    return
+                xs = [0.0]; ys = [1.0]
+                for t, S in zip(km_df['time'].values, km_df['survival'].values):
+                    xs.extend([t, t]); ys.extend([ys[-1], S])
+                tmax = max(1.0, float(years[-1] - years[0]))
+                if xs[-1] < tmax:
+                    xs.append(tmax); ys.append(ys[-1])
+                ax.plot(xs, ys, drawstyle='steps-post', color=color, lw=2, label='survival rate')
+
+                tau_hat, var_tau, ci_tau, n_events, n_total = a4_tuple
+                if tau_hat is not None and n_events > 0 and np.isfinite(tau_hat):
+                    tvals = np.linspace(0.0, tmax, 300)
+                    S_exp = np.exp(-tvals / float(tau_hat))
+                    ax.plot(tvals, S_exp, color=color, ls='--', lw=1.5, label=f"mean τ={tau_hat:.1f}")
+                    low, high = ci_tau
+                    if low is not None and high is not None and low > 0 and high > 0:
+                        S_low = np.exp(-tvals / float(high))
+                        S_high = np.exp(-tvals / float(low))
+                        ax.fill_between(tvals, S_low, S_high, color=color, alpha=0.12)
+                ax.set_xlabel("Years")
+                ax.set_ylabel("Survival S(t)")
+                ax.set_xlim(0, tmax)
+                ax.set_ylim(0.0, 1.03)
+                ax.grid(alpha=0.25)
+                ax.legend(fontsize=8)
+                ax.set_title(label)
+
+            _plot_km_with_mle(ax_p, km_p, a4_mle_p, 'orange', 'Polder (A)')
+            _plot_km_with_mle(ax_i, km_i, a4_mle_i, 'tab:blue', 'Inundated (I)')
+            _plot_km_with_mle(ax_m, km_m, a4_mle_m, 'green', 'Marsh (S)')
+
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            figs[island_name] = fig
+
+        # assemble summary
+        tauA_p, varA_p, ciA_p, events_p, n_p_total = a4_mle_p
+        tauA_i, varA_i, ciA_i, events_i, n_i_total = a4_mle_i
+        tauA_m, varA_m, ciA_m, events_m, n_m_total = a4_mle_m
+
+        summary_rows.append({
+            "island": island_name,
+            "n_polder": int(dur_p.size), "events_polder": int(np.sum(ev_p)),
+            "A4MLE_polder_tau": float(tauA_p) if tauA_p is not None else None,
+            "A4MLE_polder_ci_low": float(ciA_p[0]) if ciA_p and ciA_p[0] is not None else None,
+            "A4MLE_polder_ci_high": float(ciA_p[1]) if ciA_p and ciA_p[1] is not None else None,
+
+            "n_inund": int(dur_i.size), "events_inund": int(np.sum(ev_i)),
+            "A4MLE_inund_tau": float(tauA_i) if tauA_i is not None else None,
+            "A4MLE_inund_ci_low": float(ciA_i[0]) if ciA_i and ciA_i[0] is not None else None,
+            "A4MLE_inund_ci_high": float(ciA_i[1]) if ciA_i and ciA_i[1] is not None else None,
+
+            "n_marsh": int(dur_m.size), "events_marsh": int(np.sum(ev_m)),
+            "A4MLE_marsh_tau": float(tauA_m) if tauA_m is not None else None,
+            "A4MLE_marsh_ci_low": float(ciA_m[0]) if ciA_m and ciA_m[0] is not None else None,
+            "A4MLE_marsh_ci_high": float(ciA_m[1]) if ciA_m and ciA_m[1] is not None else None,
+        })
+
+    df_summary = pd.DataFrame(summary_rows)
+    if save_csv:
+        df_summary.to_csv(save_csv, index=False)
+        print("Saved summary to", save_csv)
+    g['figs_A4_MLE'] = figs
+    g['df_summary_A4_MLE'] = df_summary
+    print("Completed A4-MLE analysis. Figures in 'figs_A4_MLE', summary in 'df_summary_A4_MLE'.")
+    return figs, df_summary
+
+
+# Reuse the previous Kaplan-Meier builder for consistency
+def _kaplan_meier_table(durations, events):
+    if durations.size == 0:
+        return pd.DataFrame(columns=["time","n_at_risk","events","censored","survival","var_surv"])
+    dur = np.asarray(durations, dtype=float)
+    ev = np.asarray(events, dtype=int)
+    uniq_times = np.sort(np.unique(dur))
+    S = 1.0
+    var_acc = 0.0
+    rows = []
+    for t in uniq_times:
+        at_risk = int(np.sum(dur >= t))
+        d_i = int(np.sum((dur == t) & (ev == 1)))
+        c_i = int(np.sum((dur == t) & (ev == 0)))
+        if at_risk > 0 and d_i > 0:
+            q = 1.0 - (d_i / float(at_risk))
+            S = S * q
+            if at_risk - d_i > 0:
+                var_acc += d_i / (float(at_risk) * float(at_risk - d_i))
+        varS = (var_acc * (S**2)) if at_risk > 0 else 0.0
+        rows.append((float(t), at_risk, d_i, c_i, float(S), float(varS)))
+    km = pd.DataFrame(rows, columns=["time","n_at_risk","events","censored","survival","var_surv"])
+    return km
+
+
+if __name__ == "__main__":
+    compute_and_plot_all_islands_A4_mle()
+```
+## **Kaplan-meier survival rates for zeeland as whole**
+This is the part for survival analysis. Is uses 'blobs' or patches, which are areas that merges pixels if they are the same as neighbor. This way we do not have the issue of very small (less than 3 pixels) events and focus on the larger system dynamics. Additionally it is way faster this way. 
+These patches are used for statistical survival analysis (e.g., Kaplan-Meier estimation) to understand the persistence of land features like marshes, inundation, or polders.
 ```python
-#%% Do the same but for the whole of Zeeland; Added a function that creates merged neighbour pixel 'blobs' in order to not see them all as seperate events. 
+#%%  Add a function that creates merged neighbour pixel 'blobs' in order to not see them all as seperate events. 
 # Full integrated code: detect patches + KM with pointwise 95% CI + plotting (Zeeland)
 # ----------------------------
 # helper: detect change patches
@@ -2576,104 +3039,7 @@ def compute_and_plot_zeeland_A4_mle(years=None, save_csv=None, px_area_ha=None, 
 
     a4_mle_p = _compute_A4_mle_from_episodes(dur_p, ev_p)
     a4_mle_i = _compute_A4_mle_from_episodes(dur_i, ev_i)
-    a4_mle_m = _compute_A4_mle_from_episodes(dur_m, ev_m)
-
-    # Plot pooled KM + exponential overlays
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        plt = None
-
-    fig = None
-    if plt is not None:
-        fig, axes = plt.subplots(3, 1, figsize=(9, 10), squeeze=False)
-        fig.suptitle("Survival probability per cover type and mean lifetimes for Zeeland", fontsize=18)
-        ax_p = axes[0][0]; ax_i = axes[1][0]; ax_m = axes[2][0]
-    
-        def _plot_km_with_mle(ax, km_df, a4_tuple, color, label):
-            if km_df.empty:
-                ax.text(0.5, 0.5, "No episodes", transform=ax.transAxes, ha='center', va='center')
-                ax.set_xlim(0, max(1.0, float(years[-1] - years[0])))
-                ax.set_ylim(0, 1.02)
-                ax.set_title(label)
-                return
-    
-            km_lw = 3.0
-            exp_lw = 2.5
-            ci_alpha = 0.18
-    
-            tmax = max(1.0, float(years[-1] - years[0]))
-    
-            # step arrays for KM and pointwise CI
-            xs, ys, ci_low_step, ci_high_step = make_step_arrays(km_df, tmax)
-    
-            # fill KM pointwise 95% CI
-            ax.fill_between(xs, ci_low_step, ci_high_step, color=color, alpha=ci_alpha*0.8, step='post', linewidth=0)
-    
-            # plot KM step
-            ax.plot(xs, ys, drawstyle='steps-post', color=color, lw=km_lw, label='KM survival')
-    
-            # exponential fit and its CI from a4_tuple (tau CI -> survival CI)
-            tau_hat, var_tau, ci_tau, n_events, n_total = a4_tuple
-            if tau_hat is not None and n_events > 0 and np.isfinite(tau_hat):
-                tvals = np.linspace(0.0, tmax, 300)
-                S_exp = np.exp(-tvals / float(tau_hat))
-                # compute CI endpoints (use provided ci_tau if present, otherwise approximate)
-                if ci_tau and ci_tau[0] is not None and ci_tau[1] is not None:
-                    ci_low, ci_high = float(ci_tau[0]), float(ci_tau[1])
-                else:
-                    z = norm.ppf(0.975)
-                    se_approx = float(tau_hat) / max(1.0, np.sqrt(max(1, int(n_events))))
-                    ci_low = max(0.0, float(tau_hat) - z * se_approx)
-                    ci_high = float(tau_hat) + z * se_approx
-                
-                half_width = 0.5 * (ci_high - ci_low)
-                label_str = f"mean τ={tau_hat:.1f} \u00B1 {half_width:.1f} yr"
-                
-                # then plot using the new label
-                ax.plot(tvals, S_exp, color=color, ls='--', lw=exp_lw, label=label_str)
-               # ax.plot(tvals, S_exp, color=color, ls='--', lw=exp_lw, label=f"mean τ={tau_hat:.1f}")
-    
-                # plot CI band for exponential survival if CI for tau provided or approximate
-                low, high = (None, None)
-                if ci_tau and ci_tau[0] is not None and ci_tau[1] is not None:
-                    low, high = ci_tau[0], ci_tau[1]
-                else:
-                    # approximate CI
-                    z = norm.ppf(0.975)
-                    se_approx = float(tau_hat) / max(1.0, np.sqrt(max(1, int(n_events))))
-                    low = max(0.0, float(tau_hat) - z * se_approx)
-                    high = float(tau_hat) + z * se_approx
-    
-                if low is not None and high is not None and low > 0 and high > 0:
-                    S_low = np.exp(-tvals / float(high))
-                    S_high = np.exp(-tvals / float(low))
-                    ax.fill_between(tvals, S_low, S_high, color=color, alpha=ci_alpha, linewidth=0)
-    
-                # --- Minimal vertical line + concise tau ± half-width label ---
-                ax.axvline(tau_hat, color='0.15', linestyle='--', linewidth=1.2, alpha=0.9, zorder=20)
-    
-            
-            ax.set_xlabel("Years", fontsize=16)
-            ax.set_ylabel("Survival S(t)", fontsize=16)
-            ax.tick_params(axis='both', which='major', labelsize= 14)
-            ax.set_xlim(0, tmax)
-            ax.set_ylim(0.0, 1.03)
-            ax.grid(alpha=0.25)
-            ax.legend(fontsize=14)
-            ax.set_title(label, fontsize=16)
-    
-        _plot_km_with_mle(ax_p, km_p, a4_mle_p, 'tab:blue', 'Polder (A)')
-        _plot_km_with_mle(ax_i, km_i, a4_mle_i, 'orange', 'Inundated (I)')
-        _plot_km_with_mle(ax_m, km_m, a4_mle_m, 'green', 'Marsh (S)')
-    
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-    
-    # Save figure in globals
-    figs = g.get('figs_A4_MLE', {})
-    if fig is not None:
-        figs['Zeeland'] = fig
-        g['figs_A4_MLE'] = figs
+    a4_mle_m = _compute_A4_mle_from_episodes(dur_m, ev_m)  
     
     # summary values from A4-MLE tuples
     tauA_p, varA_p, ciA_p, events_p, n_p_total = a4_mle_p
@@ -2709,12 +3075,10 @@ def compute_and_plot_zeeland_A4_mle(years=None, save_csv=None, px_area_ha=None, 
             print("Saved Zeeland summary to", save_csv)
     
     return fig, summary_row
-
-# Example usage:
-#fig_zeeland, zeeland_summary = compute_and_plot_zeeland_A4_mle(min_patch_area=3, connectivity=2, random_seed=42)
 ```
 ## **CCDF and manually add 1953**
 The 1953 event is added manually but this must only be run once otherwise it adds multiple events. If this is done, uncomment the part in the end to remove this last entry. 
+This code block calculates the CCDF based on the inundation events and sizes. We take base year = 1250 and extract the data from the globals again. It was built on the fact we have islands, so if islands=True set above it does it combines events across islands, otherwise it does not. 
 ```python
 #%% CCDF (per-year-aggregated option) and add 1953 manually, only run this once otherwise multiple 1953 events!! 
 # create per-year combined inundation totals and store in globals()['inundations_combined']
@@ -2756,15 +3120,6 @@ print(
 )
 
 def add_manual_inundation(year: int, area_ha: float, island_id=None, note="manual_add", store_key_prefer="inundation_events_df_all"):
-    """
-    Append a single manual event to the events table in globals and update inundations_combined.
-    Does NOT call any Clauset fitting routines.
-    - year: int year of event
-    - area_ha: flooded area in hectares (float)
-    - island_id: optional island identifier
-    - note: string to mark provenance (stored in 'manual_flag' column)
-    - store_key_prefer: which global key to prefer ('inundation_events_df_all' by default)
-    """
     g = globals()
 
     # pick existing events key (prefer the '_all' table if present)
@@ -2825,7 +3180,319 @@ def add_manual_inundation(year: int, area_ha: float, island_id=None, note="manua
 add_manual_inundation(1953, 38000, island_id="manual_island_1")
 # IF YOU RUN THIS MORE THAN ONCE IT ADDS IT TWICE --> inundation_events_df_all = inundation_events_df_all.drop(index=[-1]) to remove last 1953 entry if needed
 ```
-## **Authors**
+## **CCDF for different regimes ** 
+This is the final code block with the CCDF for the different regimes. It calculates the CCDF per period. Each period is defined and the data is split accordingly. Labels are added to highlight which event it is and a clauset function is called again with the n_boot and min_tail setting. 
+```python
+#%% CCDF panels with PL overlays + KS marker + event-year annotations (per-year summed totals, recompute fits)
+g = globals()
 
+# --- 1) Build per-year combined table (one row per year = sum across islands) ---
+# explicit None checks to avoid ambiguous DataFrame truth-value errors
+if g.get('inundation_events_df_all') is not None:
+    events_all = g['inundation_events_df_all']
+
+if events_all is None:
+    raise RuntimeError("No 'inundation_events_df_all' or 'inundation_events_df' found in globals().")
+
+df_ev = pd.DataFrame(events_all)
+df_ev = df_ev[df_ev['area_ha'].notna() & (df_ev['area_ha'] > 0)].copy()
+
+df_comb = df_ev.groupby('year', as_index=False).agg(
+    total_inundation_ha=('area_ha', 'sum'),
+    n_events=('area_ha', 'count')
+).sort_values('year').reset_index(drop=True)
+
+if 'island_id' in df_ev.columns:
+    n_islands = df_ev.groupby('year')['island_id'].nunique().reset_index(name='n_islands')
+    df_comb = df_comb.merge(n_islands, on='year', how='left')
+else:
+    df_comb['n_islands'] = np.nan
+
+# store for reuse
+g['inundations_combined'] = df_comb
+print(f"Built 'inundations_combined' with {len(df_comb)} years (range {df_comb['year'].min()}–{df_comb['year'].max()})")
+
+# --- 2) Define windows and highlighted years ---
+windows = [
+    ('Total', '1250–1950', None, None),
+    ('Regional Water Boards (waterschappen)', '1250 – 1500', 1250, 1500),
+    ('Provincial Authorities (States of Zeeland)', '1500 – 1798', 1500, 1798),
+    ('National Water Authority (Rijkswaterstaat)', '1798 - present', 1798, 1955),
+]
+
+# put years you want labelled here
+highlight_events = [
+    {'year':1808, 'label':'1808'},
+    {'year':1404, 'label':"1st Sint-Elisabeth's Day Flood 1404"},
+    {'year':1530, 'label':'St Felix quade saterdach 1530'},
+    {'year':1421, 'label':"2nd Sint-Elisabeth's Day Flood 1421"},
+    {'year':1532, 'label':"All Saints' Flood 1532"},
+    {'year':1625, 'label':'1625'},
+    {'year':1707, 'label':'Christmas Flood 1707'},
+    {'year':1551, 'label':"Pontiaans' Flood 1551"},
+    {'year':1570, 'label':"All Saints' Flood 1570"},
+    {'year':1682, 'label':'1682'},
+    {'year':1299, 'label':'1299'},   # this one will be placed top-right
+    {'year':1334, 'label':'1334'},
+    {'year':1825, 'label':'1825'},
+    {'year':1906, 'label':'1906'},
+    {'year':1953, 'label':'1953'},
+]
+
+# --- 3) Prepare df_for_analysis (rename summed column to area_ha) ---
+df_for_analysis = df_comb.rename(columns={'total_inundation_ha': 'area_ha'})[['year', 'area_ha']].copy()
+
+# --- 4) Recompute Clauset fits on per-year summed data (ensure consistency) ---
+n_boot = 5000
+min_tail = 10
+
+print("Running Clauset fits on per-year summed data (this may take some time)...")
+# analyze_windows_clauset must be available in the environment
+results = analyze_windows_clauset(df_for_analysis, windows, n_boot=n_boot, min_tail=min_tail,
+                                  seed=12345, annotate_axes=None, progress=True, aggregate='per_event')
+print("Clauset fits completed. Summary:")
+for title, _, _, _ in windows:
+    r = results.get(title, {})
+    print(f" {title}: n={r.get('n')}, xmin={r.get('xmin')}, alpha={r.get('alpha')}, n_tail={r.get('n_tail')}, D={r.get('D')}, p={r.get('gof_p')}")
+
+# --- 5) Build CCDFs for plotting (from df_comb total_inundation_ha) ---
+ccdfs = {}
+df_sizes_by_window = {}
+for title, time_label, y0, y1 in windows:
+    mask = np.ones(len(df_comb), dtype=bool)
+    if y0 is not None:
+        mask &= (df_comb['year'] >= int(y0))
+    if y1 is not None:
+        mask &= (df_comb['year'] < int(y1))
+    sizes = df_comb.loc[mask, 'total_inundation_ha'].to_numpy(dtype=float)
+    sizes = sizes[np.isfinite(sizes) & (sizes > 0)]
+    sizes.sort()
+    df_sizes_by_window[title] = sizes
+    n = sizes.size
+    if n == 0:
+        ccdfs[title] = (np.array([]), np.array([]))
+    else:
+        ccdfs[title] = (sizes, np.arange(n, 0, -1).astype(float) / float(n))
+
+# --- 6) Determine plot limits ---
+all_x = np.concatenate([x for x, c in ccdfs.values() if x.size > 0]) if any(x.size > 0 for x, c in ccdfs.values()) else np.array([1.0])
+xmin_plot = max(min(all_x.min(), 1.0), 1e-6)
+xmax_plot = max(all_x.max(), xmin_plot * 10.0)
+all_ccdf_vals = np.concatenate([c for x, c in ccdfs.values() if c.size > 0]) if any(x.size > 0 for x, c in ccdfs.values()) else np.array([1.0])
+ymin_plot = max(all_ccdf_vals.min(), 1e-6)
+ymax_plot = 1.0
+
+# --- 7) Plot panels, using results computed on df_for_analysis (per-year totals) ---
+fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=False, sharey=False)
+axes = axes.ravel()
+panel_colors = ['k', 'C0', 'C4', 'C2']
+x_ref, c_ref = ccdfs.get('Total', (np.array([]), np.array([])))
+
+for j, (ax, (title, time_label, y0, y1), color) in enumerate(zip(axes, windows, panel_colors)):
+    x, c = ccdfs.get(title, (np.array([]), np.array([])))
+
+    # reference Total curve in non-total panels
+    if title != 'Total' and x_ref.size > 0:
+        ax.loglog(x_ref, c_ref, ls='-', lw=1.0, color='0.6', alpha=0.8, label='Total')
+
+    # empirical CCDF (per-year totals)
+    if x.size > 0:
+        ax.loglog(x, c, ls='None', marker='o', ms=6, color=color, alpha=0.95, label=f'{time_label} (n={len(x)})')
+    else:
+        ax.text(0.5, 0.5, 'no years', transform=ax.transAxes, ha='center', va='center')
+
+    # Clauset fit for this window
+    res = results.get(title, {})
+    xmin = res.get('xmin', None)
+    alpha = res.get('alpha', None)
+    n_tail = res.get('n_tail', 0)
+    n_total = res.get('n', max(1, len(x)))
+    gof_p = res.get('gof_p', None)
+
+    if xmin is not None and alpha is not None and x.size > 0:
+        ax.axvline(xmin, color='0.6', linestyle='-', linewidth=0.8, alpha=0.9)
+
+        tail_mask = x >= xmin
+        if tail_mask.any():
+            ax.plot(x[tail_mask], c[tail_mask], ls='None', marker='s', ms=6, color='orange',
+                    markeredgecolor='k', markeredgewidth=0.3, alpha=0.95, label='tail data')
+
+        x_max_for_model = x.max()
+        if x_max_for_model > xmin:
+            tvals = np.logspace(np.log10(max(xmin, 1e-12)), np.log10(x_max_for_model), 400)
+            model_ccdf = (float(n_tail) / float(max(1, n_total))) * (tvals / float(xmin)) ** (1.0 - float(alpha))
+            ax.plot(tvals, model_ccdf, color='orange', ls='--', lw=1.6, alpha=0.95, label='Power-Law fit')
+
+        # values box top-left (unchanged)
+        ks_display = res.get('D', np.nan)
+        txt = (f"xmin={xmin:.1f}\nα={alpha:.2f}\nn_tail={n_tail}\nKS={ks_display:.3f}\np={gof_p:.3f}"
+               if gof_p is not None else f"xmin={xmin:.1f}\nα={alpha:.2f}\nn_tail={n_tail}\nKS={ks_display:.3f}")
+        ax.text(0.05, 0.4, txt, transform=ax.transAxes, ha='left', va='bottom',
+                fontsize=14, bbox=dict(facecolor='white', alpha=0.75, edgecolor='none'))
+
+    # --- Annotate highlighted years (labels placed lower-left by default, but 1299 top-right) ---
+    sizes_array = df_sizes_by_window[title]
+    n_panel = sizes_array.size
+    if n_panel > 0 and highlight_events:
+        # canonicalize highlight list
+        canonical = []
+        for h in highlight_events:
+            if isinstance(h, dict) and 'year' in h:
+                dd = h.copy()
+                dd.setdefault('label', str(dd['year']))
+                dd.setdefault('offset', None)
+                canonical.append(dd)
+            else:
+                try:
+                    yr = int(h)
+                    canonical.append({'year': yr, 'label': str(yr), 'offset': None})
+                except Exception:
+                    continue
+
+        annots = []
+        for ev in canonical:
+            year = int(ev['year'])
+            if y0 is not None and year < y0:
+                continue
+            if y1 is not None and year >= y1:
+                continue
+            row = df_comb.loc[df_comb['year'] == year]
+            if row.empty:
+                continue
+            s_val = float(row['total_inundation_ha'].iloc[0])
+            c_emp = float(np.sum(sizes_array >= s_val) / max(1, n_panel))
+            # Per-label offsets: default lower-left (factors < 1)
+            if ev.get('offset') is None:
+                # special-case year 1299: place top-right initially
+                if year == 1299:
+                    xfact, yfact = 1.4, 1.4   # top-right ( > 1 )
+                else:
+                    xfact, yfact = 0.7, 0.7   # lower-left ( < 1 )
+            else:
+                try:
+                    xfact, yfact = float(ev['offset'][0]), float(ev['offset'][1])
+                except Exception:
+                    xfact, yfact = (1.4, 1.4) if year == 1299 else (0.7, 0.7)
+            tx = s_val * xfact
+            ty = c_emp * yfact
+            annots.append({'year': year, 'x': s_val, 'y': c_emp, 'tx': tx, 'ty': ty, 'label': ev['label']})
+
+        if annots:
+            text_artists = []
+            for a in annots:
+                # default: lower-left -> ha='right', va='top'
+                if a['year'] == 1299:
+                    ha = 'left'; va = 'bottom'    # top-right placement relative to anchor
+                    prefer_up = True
+                else:
+                    ha = 'right'; va = 'top'      # lower-left placement relative to anchor
+                    prefer_up = False
+
+                t = ax.text(a['tx'], a['ty'], a['label'],
+                            fontsize=11, color='black',
+                            bbox=dict(facecolor='white', alpha=0.9, edgecolor='none'),
+                            horizontalalignment=ha, verticalalignment=va, zorder=25)
+                text_artists.append({'artist': t, 'anchor_x': a['x'], 'anchor_y': a['y'], 'prefer_up': prefer_up})
+
+            # de-overlap in display coords: prefer downward shifts for defaults, upward for 1299
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bboxes = [ta['artist'].get_window_extent(renderer=renderer) for ta in text_artists]
+
+            assigned_bboxes = []
+            max_layers = 40
+            pad = 3
+            for ta, bb in zip(text_artists, bboxes):
+                overlap = any(bb.overlaps(ab) for ab in assigned_bboxes)
+                if not overlap:
+                    assigned_bboxes.append(bb)
+                    continue
+                placed = False
+                signs_order = (-1, 1) if not ta.get('prefer_up', False) else (1, -1)
+                for layer in range(1, max_layers + 1):
+                    for sign in signs_order:
+                        dy = sign * layer * (bb.height + pad)
+                        bb_candidate = bb.translated(0, dy)
+                        if not any(bb_candidate.overlaps(ab) for ab in assigned_bboxes):
+                            cur_pos_disp = ax.transData.transform(ta['artist'].get_position())
+                            new_pos_disp = (cur_pos_disp[0], cur_pos_disp[1] + dy)
+                            new_data_pos = ax.transData.inverted().transform(new_pos_disp)
+                            ta['artist'].set_position((new_data_pos[0], new_data_pos[1]))
+                            fig.canvas.draw()
+                            renderer = fig.canvas.get_renderer()
+                            new_bb = ta['artist'].get_window_extent(renderer=renderer)
+                            assigned_bboxes.append(new_bb)
+                            placed = True
+                            break
+                    if placed:
+                        break
+                if not placed:
+                    assigned_bboxes.append(bb)
+
+            # draw markers and arrows
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            for ta in text_artists:
+                artist = ta['artist']
+                lbl = artist.get_text()
+                is_1953 = (lbl == '1953')
+                anchor_x = ta['anchor_x']
+                anchor_y = ta['anchor_y']
+
+                ax.plot(
+                    anchor_x, anchor_y,
+                    marker='*',
+                    ms=16 if is_1953 else 10,
+                    color='magenta' if is_1953 else 'red',
+                    markeredgecolor='k',
+                    markeredgewidth=0.9 if is_1953 else 0.8,
+                    zorder=35 if is_1953 else 30
+                )
+                txt_x, txt_y = artist.get_position()
+                ax.annotate('', xy=(anchor_x, anchor_y), xytext=(txt_x, txt_y),
+                            arrowprops=dict(arrowstyle='->', color='red', lw=0.9, shrinkA=0, shrinkB=0, mutation_scale=18),
+                            zorder=29)
+
+    # axes scales, grid, labels
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlim(xmin_plot * 0.8, xmax_plot * 1.2)
+    ax.set_ylim(ymin_plot * 0.8, ymax_plot * 1.05)
+    ax.grid(which='both', alpha=0.25)
+    ax.set_title(title, fontsize = 18)
+    if j % 2 == 0:
+        ax.set_ylabel('P(X ≥ x)', fontsize=16)
+    if j >= 2:
+        ax.set_xlabel('Total Inundation (ha)', fontsize=18)
+    if j % 2 == 1:
+        ax.tick_params(axis='y', which='both', labelleft=False)
+    else:
+        ax.tick_params(axis='y', which='both', labelleft=True)
+    if j < 2:
+        ax.tick_params(axis='x', which='both', labelbottom=False)
+    else:
+        ax.tick_params(axis='x', which='both', labelbottom=True)
+
+    # legend dedupe
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        seen = set(); new_h = []; new_l = []
+        for h, lab in zip(handles, labels):
+            if lab not in seen:
+                seen.add(lab); new_h.append(h); new_l.append(lab)
+        ax.legend(new_h, new_l, fontsize=14, loc='lower left', frameon=True, framealpha=0.9)
+
+plt.suptitle("CCDF of Inundation Events Zeeland", y=0.97, fontsize=24)
+plt.tight_layout(rect=[0.03, 0.03, 1.0, 0.95])
+
+# save results JSON
+try:
+    with open("clauset_results_zeeland.json", "w") as fh:
+        json.dump(results, fh, indent=2, default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+    print("Saved Clauset results to clauset_results_zeeland.json")
+except Exception as e:
+    print("Could not save Clauset results JSON:", e)
+plt.show()
+``` 
+## **Authors**
 - Michiel van Dijk
 
